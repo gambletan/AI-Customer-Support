@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "unified-support"
+name = "ai-customer-support"
 version = "0.1.0"
-description = "AI-native omnichannel customer support — one QR code, any IM, instant service"
+description = "AI-native omnichannel customer support — Telegram supergroup gateway with WebChat, WuKongIM, AI auto-reply, translation, and agent routing"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -14,15 +14,19 @@ dependencies = [
     "aiosqlite>=0.20",
     "aiohttp>=3.9",
     "httpx>=0.25",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 all-channels = ["unified-channel[all]>=0.2.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
+[project.scripts]
+ai-cs = "support.telegram_gateway:main_entry"
+
 [project.urls]
-Homepage = "https://github.com/gambletan/unified-support"
-Repository = "https://github.com/gambletan/unified-support"
+Homepage = "https://github.com/gambletan/AI-Customer-Support"
+Repository = "https://github.com/gambletan/AI-Customer-Support"
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
