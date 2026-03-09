@@ -300,14 +300,41 @@ All configuration via environment variables (or `.env` file).
 | `CS_ALLOWED_AGENTS` | (empty) | Comma-separated Telegram user IDs. Empty = open mode |
 | `CS_MAX_SESSIONS_PER_AGENT` | `5` | Max concurrent sessions per agent |
 
-### Feature Flags
+### Core Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CS_AI_ENABLED` | `false` | Enable AI auto-reply (FAQ + LLM) |
-| `CS_REPLY_TIMEOUT` | `180` | Seconds before timeout alert (0 = off) |
+| `CS_REPLY_TIMEOUT` | `180` | Seconds before timeout alert |
 | `CS_DB_PATH` | `cs_data.db` | SQLite database path |
 | `CS_HEALTH_INTERVAL` | `30` | Health check interval in seconds |
+
+### Feature Toggles
+
+Every optional feature can be independently enabled/disabled via environment variables.
+Core functionality (session management, message routing, topic creation, message persistence) is always on.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CS_FEATURE_TRANSLATION` | `true` | Auto language detection + bidirectional translation |
+| `CS_FEATURE_AI_REPLY` | `false` | FAQ keyword matching + LLM auto-reply |
+| `CS_FEATURE_QUEUE` | `true` | Waiting queue when all agents are at capacity |
+| `CS_FEATURE_AGENT_ASSIGNMENT` | `true` | Automatic least-load agent assignment |
+| `CS_FEATURE_SENSITIVE_FILTER` | `false` | Sensitive word detection and agent alerts |
+| `CS_FEATURE_RATINGS` | `true` | Satisfaction survey sent on `/close` |
+| `CS_FEATURE_TICKETS` | `true` | `/ticket` command for creating support tickets |
+| `CS_FEATURE_TIMEOUT_ALERTS` | `true` | Reply timeout notifications in topic threads |
+| `CS_FEATURE_ACCESS_CONTROL` | `false` | Group member whitelist (auto-kick unauthorized) |
+| `CS_FEATURE_REPORTS` | `true` | `/report` daily stats and `/hotwords` analysis |
+| `CS_FEATURE_TEMPLATES` | `true` | `/tpl` quick reply templates |
+| `CS_FEATURE_ONLINE_STATUS` | `true` | Online/offline notifications in topic threads |
+| `CS_FEATURE_HISTORY` | `true` | Unseen message delivery on reconnect |
+
+Values accepted as "true": `true`, `1`, `yes`, `on` (case-insensitive). Everything else is treated as false.
+
+**Note:** If no `CS_FEATURE_*` variables are set, all defaults apply and the system behaves
+identically to previous versions. The old `CS_AI_ENABLED` variable is replaced by `CS_FEATURE_AI_REPLY`.
+
+The `/help` command dynamically shows only commands whose backing feature is enabled.
 
 ### Complete `.env` Example
 
@@ -339,11 +366,25 @@ CS_AGENTS=alice,bob,charlie
 CS_ALLOWED_AGENTS=123456789,987654321
 CS_MAX_SESSIONS_PER_AGENT=5
 
-# === Features ===
-CS_AI_ENABLED=true
+# === Core Settings ===
 CS_REPLY_TIMEOUT=180
 CS_DB_PATH=cs_data.db
 CS_HEALTH_INTERVAL=30
+
+# === Feature Toggles (all optional, defaults shown) ===
+CS_FEATURE_TRANSLATION=true
+CS_FEATURE_AI_REPLY=false
+CS_FEATURE_QUEUE=true
+CS_FEATURE_AGENT_ASSIGNMENT=true
+CS_FEATURE_SENSITIVE_FILTER=false
+CS_FEATURE_RATINGS=true
+CS_FEATURE_TICKETS=true
+CS_FEATURE_TIMEOUT_ALERTS=true
+CS_FEATURE_ACCESS_CONTROL=false
+CS_FEATURE_REPORTS=true
+CS_FEATURE_TEMPLATES=true
+CS_FEATURE_ONLINE_STATUS=true
+CS_FEATURE_HISTORY=true
 ```
 
 ---

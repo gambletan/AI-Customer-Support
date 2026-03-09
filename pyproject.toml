@@ -23,6 +23,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 ai-cs = "support.telegram_gateway:main_entry"
+ai-cs-setup = "support.setup:main"
 
 [project.urls]
 Homepage = "https://github.com/gambletan/AI-Customer-Support"

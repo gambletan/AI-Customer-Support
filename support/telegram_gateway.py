@@ -20,6 +20,9 @@ Features:
 - Voice-to-text (OpenAI Whisper)
 - Daily report + hot keyword analysis
 
+All optional features are gated by feature flags in Config.features.
+Set CS_FEATURE_* env vars to enable/disable individual features.
+
 Configuration (env vars or ~/.env):
     CS_TELEGRAM_TOKEN="your-bot-token"
     CS_SUPPORT_GROUP_ID="-100xxxxxxxxxx"
@@ -42,11 +45,9 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv(Path.home() / ".env", override=True)
-
 from aiohttp import web
 
+from .config import Config
 from .cs_store import CSStore
 from .model_router import ModelRouter
 from unified_channel import ChannelManager
@@ -65,30 +66,14 @@ from unified_channel.types import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("customer_service")
 
-# --- Config ---
-TELEGRAM_TOKEN = os.environ["CS_TELEGRAM_TOKEN"]
-SUPPORT_GROUP_ID = os.environ["CS_SUPPORT_GROUP_ID"]
-WEBCHAT_PORT = int(os.environ.get("WEBCHAT_PORT", "8081"))
-WKIM_PORT = int(os.environ.get("WKIM_PORT", "8080"))
-DB_PATH = os.environ.get("CS_DB_PATH", "cs_data.db")
-AI_ENABLED = os.environ.get("CS_AI_ENABLED", "false").lower() == "true"
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
-REPLY_TIMEOUT_SECONDS = int(os.environ.get("CS_REPLY_TIMEOUT", "180"))  # 3 min
-MAX_SESSIONS_PER_AGENT = int(os.environ.get("CS_MAX_SESSIONS_PER_AGENT", "5"))
-
-# --- Allowed agent user IDs (Telegram user IDs who can be in the support group) ---
-# Bot's own messages are always allowed. Set via CS_ALLOWED_AGENTS env var (comma-separated Telegram user IDs)
-# If empty, all group members are treated as agents (open mode).
-ALLOWED_AGENTS: set[str] = set(
-    a.strip() for a in os.environ.get("CS_ALLOWED_AGENTS", "").split(",") if a.strip()
-)
+# --- Centralized config ---
+cfg = Config()
 
 # --- Model Router (task-based LLM routing) ---
 router = ModelRouter.from_env()
 
 # --- Persistent store ---
-store = CSStore(DB_PATH)
+store = CSStore(cfg.db_path)
 
 # --- In-memory caches ---
 session_to_topic: dict[str, int] = {}
@@ -96,16 +81,13 @@ topic_to_session: dict[int, str] = {}
 session_channel: dict[str, str] = {}
 
 # Track pending replies for timeout alerts
-pending_replies: dict[str, asyncio.Task] = {}  # session_id → timeout task
+pending_replies: dict[str, asyncio.Task] = {}  # session_id -> timeout task
 
 # --- Waiting queue (when all agents are busy) ---
 waiting_queue: list[str] = []  # list of session_ids awaiting assignment
 
 # --- Keyed queue for per-customer message serialization ---
 _msg_queue = KeyedAsyncQueue()
-
-# --- Agent list ---
-AGENTS: list[str] = os.environ.get("CS_AGENTS", "").split(",") if os.environ.get("CS_AGENTS") else []
 
 # --- FAQ ---
 FAQ: dict[str, str] = {
@@ -266,7 +248,7 @@ async def get_or_create_topic(
     topic_name = f"👤 {name or user_id}" if is_auth else f"💬 访客_{session_id[:6]}"
 
     topic = await tg._app.bot.create_forum_topic(
-        chat_id=int(SUPPORT_GROUP_ID),
+        chat_id=int(cfg.support_group_id),
         name=topic_name,
     )
     topic_id = topic.message_thread_id
@@ -281,7 +263,10 @@ async def get_or_create_topic(
         user_name=name, user_phone=user_info.get("phone"),
     )
 
-    assigned = auto_assign_agent(session_id)
+    # Agent assignment (gated)
+    assigned = None
+    if cfg.features.agent_assignment:
+        assigned = auto_assign_agent(session_id)
 
     lines = [f"{'👤 登录用户' if is_auth else '💬 匿名访客'}"]
     lines.append(f"• 会话ID: `{session_id}`")
@@ -300,7 +285,7 @@ async def get_or_create_topic(
     lines.append(f"\n直接回复即可。输入 /help 查看所有命令。")
 
     await tg._app.bot.send_message(
-        chat_id=int(SUPPORT_GROUP_ID),
+        chat_id=int(cfg.support_group_id),
         message_thread_id=topic_id,
         text="\n".join(lines),
         parse_mode="Markdown",
@@ -316,11 +301,11 @@ async def get_or_create_topic(
 
 def auto_assign_agent(session_id: str) -> str | None:
     """Assign the least-loaded agent. Returns None if no agents or all are at capacity."""
-    if not AGENTS:
+    if not cfg.agents:
         return None
     load = store.get_agent_load()
-    agent = min(AGENTS, key=lambda a: load.get(a, 0))
-    if load.get(agent, 0) >= MAX_SESSIONS_PER_AGENT:
+    agent = min(cfg.agents, key=lambda a: load.get(a, 0))
+    if load.get(agent, 0) >= cfg.max_sessions_per_agent:
         return None  # all agents at capacity
     store.set_assigned_agent(session_id, agent)
     return agent
@@ -344,7 +329,7 @@ async def _dequeue_next(manager: ChannelManager) -> None:
     topic_id = session_to_topic.get(next_sid)
     if topic_id:
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID),
+            chat_id=int(cfg.support_group_id),
             message_thread_id=topic_id,
             text=f"📥 排队用户已分配给客服 {assigned}，请及时处理。",
         )
@@ -356,7 +341,7 @@ async def _dequeue_next(manager: ChannelManager) -> None:
             text="客服已接入，请描述您的问题。",
         ))
 
-    logger.info("dequeued session %s → agent %s (remaining: %d)", next_sid, assigned, len(waiting_queue))
+    logger.info("dequeued session %s -> agent %s (remaining: %d)", next_sid, assigned, len(waiting_queue))
 
 
 # =============================================================================
@@ -365,9 +350,6 @@ async def _dequeue_next(manager: ChannelManager) -> None:
 
 async def try_ai_reply(text: str) -> str | None:
     """Try AI auto-reply. Uses FAQ keyword match first, then LLM if available."""
-    if not AI_ENABLED:
-        return None
-
     # FAQ keyword match (fast path)
     text_lower = text.strip().lower()
     for keyword, answer in FAQ.items():
@@ -408,7 +390,7 @@ async def try_ai_reply(text: str) -> str | None:
 
 async def _timeout_alert(manager: ChannelManager, session_id: str, topic_id: int) -> None:
     """Wait for timeout, then alert agents."""
-    await asyncio.sleep(REPLY_TIMEOUT_SECONDS)
+    await asyncio.sleep(cfg.reply_timeout)
 
     # Check if still pending
     if session_id not in pending_replies:
@@ -417,9 +399,9 @@ async def _timeout_alert(manager: ChannelManager, session_id: str, topic_id: int
     tg = manager._channels["telegram"]
     assert isinstance(tg, TelegramAdapter) and tg._app
 
-    minutes = REPLY_TIMEOUT_SECONDS // 60
+    minutes = cfg.reply_timeout // 60
     await tg._app.bot.send_message(
-        chat_id=int(SUPPORT_GROUP_ID),
+        chat_id=int(cfg.support_group_id),
         message_thread_id=topic_id,
         text=f"⏰ 用户已等待 {minutes} 分钟未收到回复！请尽快处理。",
     )
@@ -427,6 +409,8 @@ async def _timeout_alert(manager: ChannelManager, session_id: str, topic_id: int
 
 
 def start_reply_timer(manager: ChannelManager, session_id: str, topic_id: int) -> None:
+    if not cfg.features.timeout_alerts:
+        return
     # Cancel existing timer
     old = pending_replies.pop(session_id, None)
     if old:
@@ -443,7 +427,7 @@ def cancel_reply_timer(session_id: str) -> None:
 
 
 # =============================================================================
-# Forward: User → Telegram (with language detection + sensitive filter)
+# Forward: User -> Telegram (with language detection + sensitive filter)
 # =============================================================================
 
 async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> None:
@@ -451,8 +435,8 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
     if not session_id:
         return
 
-    # If this session is queued, just acknowledge — don't create topic yet
-    if session_id in waiting_queue:
+    # If queue feature is on and this session is queued, just acknowledge
+    if cfg.features.queue and session_id in waiting_queue:
         pos = waiting_queue.index(session_id) + 1
         user_ch = _find_user_channel(manager, session_id)
         if user_ch:
@@ -465,8 +449,8 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
     user_info = msg.metadata.get("user_info", {})
     topic_id = await get_or_create_topic(manager, session_id, user_info, msg.channel)
 
-    # Check if session has no agent (all busy) — queue it
-    if AGENTS and not store.get_assigned_agent(session_id):
+    # Check if session has no agent (all busy) — queue it (gated)
+    if cfg.features.queue and cfg.agents and not store.get_assigned_agent(session_id):
         if session_id not in waiting_queue:
             waiting_queue.append(session_id)
             pos = len(waiting_queue)
@@ -479,7 +463,7 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
             tg = manager._channels["telegram"]
             assert isinstance(tg, TelegramAdapter) and tg._app
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID),
+                chat_id=int(cfg.support_group_id),
                 message_thread_id=topic_id,
                 text=f"⏳ 所有客服已满，用户已进入排队 (队列位置: {pos})",
             )
@@ -487,26 +471,27 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
 
     text = msg.content.text or ""
 
-    # Detect and store user language (on first text message)
-    if msg.content.type == ContentType.TEXT and text:
+    # Detect and store user language (on first text message) — gated by translation feature
+    if cfg.features.translation and msg.content.type == ContentType.TEXT and text:
         lang = await detect_language(text)
         current_lang = store.get_user_lang(session_id)
         if current_lang == "zh" and lang != "zh":
             store.set_user_lang(session_id, lang)
             logger.info("session %s language detected: %s", session_id, lang)
 
-    # Sensitive word check
-    matched = check_sensitive(text)
-    if matched:
-        store.log_sensitive(session_id, text, matched)
-        # Notify agent, but still forward
-        tg = manager._channels["telegram"]
-        assert isinstance(tg, TelegramAdapter) and tg._app
-        await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID),
-            message_thread_id=topic_id,
-            text=f"⚠️ 敏感词检测: {', '.join(matched)}",
-        )
+    # Sensitive word check — gated
+    if cfg.features.sensitive_filter:
+        matched = check_sensitive(text)
+        if matched:
+            store.log_sensitive(session_id, text, matched)
+            # Notify agent, but still forward
+            tg = manager._channels["telegram"]
+            assert isinstance(tg, TelegramAdapter) and tg._app
+            await tg._app.bot.send_message(
+                chat_id=int(cfg.support_group_id),
+                message_thread_id=topic_id,
+                text=f"⚠️ 敏感词检测: {', '.join(matched)}",
+            )
 
     # Persist message
     store.add_message(
@@ -514,14 +499,14 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
         media_url=msg.content.media_url, media_type=msg.content.media_type,
     )
 
-    # AI auto-reply
-    if msg.content.type == ContentType.TEXT and text:
+    # AI auto-reply — gated
+    if cfg.features.ai_reply and msg.content.type == ContentType.TEXT and text:
         if text.strip() in ("转人工", "agent", "human"):
             cancel_reply_timer(session_id)
             tg = manager._channels["telegram"]
             assert isinstance(tg, TelegramAdapter) and tg._app
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID),
+                chat_id=int(cfg.support_group_id),
                 message_thread_id=topic_id,
                 text=f"👤 用户请求转人工\n\n> {text}",
             )
@@ -537,7 +522,7 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
             tg = manager._channels["telegram"]
             assert isinstance(tg, TelegramAdapter) and tg._app
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID),
+                chat_id=int(cfg.support_group_id),
                 message_thread_id=topic_id,
                 text=f"👤 {text}\n\n🤖 _{ai_reply}_",
                 parse_mode="Markdown",
@@ -548,11 +533,11 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
     tg = manager._channels["telegram"]
     assert isinstance(tg, TelegramAdapter) and tg._app
 
-    # Translate user message for agent if not Chinese
+    # Translate user message for agent if not Chinese — gated
     user_lang = store.get_user_lang(session_id)
     display_text = text
 
-    if user_lang != "zh" and text and router.get_backend("translate"):
+    if cfg.features.translation and user_lang != "zh" and text and router.get_backend("translate"):
         translated = await translate_text(text, "zh", user_lang)
         if translated != text:
             display_text = f"{text}\n\n🌐 _{translated}_"
@@ -567,7 +552,7 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
             if media_type == "video":
                 buf.name = "video.mp4"
                 await tg._app.bot.send_video(
-                    chat_id=int(SUPPORT_GROUP_ID),
+                    chat_id=int(cfg.support_group_id),
                     message_thread_id=topic_id,
                     video=buf,
                     caption=display_text or None,
@@ -575,7 +560,7 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
             else:
                 buf.name = "image.jpg"
                 await tg._app.bot.send_photo(
-                    chat_id=int(SUPPORT_GROUP_ID),
+                    chat_id=int(cfg.support_group_id),
                     message_thread_id=topic_id,
                     photo=buf,
                     caption=display_text or None,
@@ -583,32 +568,32 @@ async def forward_to_telegram(manager: ChannelManager, msg: UnifiedMessage) -> N
         else:
             if media_type == "video":
                 await tg._app.bot.send_video(
-                    chat_id=int(SUPPORT_GROUP_ID),
+                    chat_id=int(cfg.support_group_id),
                     message_thread_id=topic_id,
                     video=data_url,
                     caption=display_text or None,
                 )
             else:
                 await tg._app.bot.send_photo(
-                    chat_id=int(SUPPORT_GROUP_ID),
+                    chat_id=int(cfg.support_group_id),
                     message_thread_id=topic_id,
                     photo=data_url,
                     caption=display_text or None,
                 )
     else:
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID),
+            chat_id=int(cfg.support_group_id),
             message_thread_id=topic_id,
             text=display_text or "(empty)",
             parse_mode="Markdown",
         )
 
-    # Start reply timeout timer
+    # Start reply timeout timer (gated inside start_reply_timer)
     start_reply_timer(manager, session_id, topic_id)
 
 
 # =============================================================================
-# Forward: Telegram → User (with auto-translation)
+# Forward: Telegram -> User (with auto-translation)
 # =============================================================================
 
 async def forward_to_user(manager: ChannelManager, msg: UnifiedMessage) -> None:
@@ -639,18 +624,18 @@ async def forward_to_user(manager: ChannelManager, msg: UnifiedMessage) -> None:
 
     agent_text = msg.content.text or ""
 
-    # Auto-translate agent reply to user's language
+    # Auto-translate agent reply to user's language — gated
     user_lang = store.get_user_lang(session_id)
     translated_text = agent_text
 
-    if user_lang != "zh" and agent_text and router.get_backend("translate"):
+    if cfg.features.translation and user_lang != "zh" and agent_text and router.get_backend("translate"):
         translated_text = await translate_text(agent_text, user_lang, "zh")
         if translated_text != agent_text:
             # Show original + translation to agent
             tg = manager._channels["telegram"]
             assert isinstance(tg, TelegramAdapter) and tg._app
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID),
+                chat_id=int(cfg.support_group_id),
                 message_thread_id=topic_id,
                 text=f"🌐 已翻译为 [{user_lang}]: _{translated_text}_",
                 parse_mode="Markdown",
@@ -664,7 +649,7 @@ async def forward_to_user(manager: ChannelManager, msg: UnifiedMessage) -> None:
         tg = manager._channels["telegram"]
         assert isinstance(tg, TelegramAdapter) and tg._app
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID),
+            chat_id=int(cfg.support_group_id),
             message_thread_id=topic_id,
             text="⚠️ 用户当前离线，消息已保存。",
         )
@@ -731,7 +716,7 @@ async def handle_agent_command(
             erp_info = "⚠️ 该用户未登录，无法查询。"
 
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+            chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
             text=erp_info, parse_mode="Markdown",
         )
 
@@ -753,28 +738,35 @@ async def handle_agent_command(
             order_info = "⚠️ 请提供手机号或客户ID: `/order 13800138000`"
 
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+            chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
             text=order_info, parse_mode="Markdown",
         )
 
     elif cmd == "tpl":
+        if not cfg.features.templates:
+            await tg._app.bot.send_message(
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
+                text="⚠️ 模板功能已关闭。",
+            )
+            return
+
         if not args:
             # List all templates
             lines = ["📝 快捷回复模板:\n"]
             for name in TEMPLATES:
                 lines.append(f"• `/tpl {name}`")
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                 text="\n".join(lines), parse_mode="Markdown",
             )
         else:
             tpl_name = args[0]
             tpl_text = TEMPLATES.get(tpl_name)
             if tpl_text:
-                # Auto-translate template if needed
+                # Auto-translate template if needed — gated
                 user_lang = store.get_user_lang(session_id)
                 send_text = tpl_text
-                if user_lang != "zh" and router.get_backend("translate"):
+                if cfg.features.translation and user_lang != "zh" and router.get_backend("translate"):
                     send_text = await translate_text(tpl_text, user_lang, "zh")
 
                 store.add_message(session_id, "agent", tpl_text)
@@ -785,26 +777,33 @@ async def handle_agent_command(
                 if user_ch:
                     await user_ch.send(OutboundMessage(chat_id=session_id, text=send_text))
                     await tg._app.bot.send_message(
-                        chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                        chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                         text=f"✅ 已发送模板「{tpl_name}」" + (f"\n🌐 {send_text}" if send_text != tpl_text else ""),
                     )
                 else:
                     await tg._app.bot.send_message(
-                        chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                        chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                         text="⚠️ 用户离线，模板消息已保存。",
                     )
             else:
                 await tg._app.bot.send_message(
-                    chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                    chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                     text=f"⚠️ 模板「{tpl_name}」不存在。输入 `/tpl` 查看所有模板。",
                     parse_mode="Markdown",
                 )
 
     elif cmd == "ticket":
+        if not cfg.features.tickets:
+            await tg._app.bot.send_message(
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
+                text="⚠️ 工单功能已关闭。",
+            )
+            return
+
         title = " ".join(args) if args else "客户问题"
         ticket_id = store.create_ticket(session_id, title, msg.sender.display_name or "")
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+            chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
             text=f"🎫 工单已创建\n• ID: #{ticket_id}\n• 标题: {title}\n• 状态: open",
         )
 
@@ -813,11 +812,11 @@ async def handle_agent_command(
         cancel_reply_timer(session_id)
 
         user_ch = _find_user_channel(manager, session_id)
-        if user_ch:
-            # Translate rating prompt if needed
+        if user_ch and cfg.features.ratings:
+            # Translate rating prompt if needed — gated
             user_lang = store.get_user_lang(session_id)
             rating_text = "感谢您的咨询！请为本次服务评分："
-            if user_lang != "zh" and router.get_backend("translate"):
+            if cfg.features.translation and user_lang != "zh" and router.get_backend("translate"):
                 rating_text = await translate_text(rating_text, user_lang, "zh")
 
             await user_ch.send(OutboundMessage(
@@ -833,19 +832,26 @@ async def handle_agent_command(
                 ],
             ))
 
+        close_msg = "✅ 会话已关闭"
+        if cfg.features.ratings and user_ch:
+            close_msg += "，已发送评价请求。"
+        else:
+            close_msg += "。"
+
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
-            text="✅ 会话已关闭，已发送评价请求。",
+            chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
+            text=close_msg,
         )
         try:
             await tg._app.bot.close_forum_topic(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
             )
         except Exception:
             pass
 
-        # Dequeue next waiting customer
-        await _dequeue_next(manager)
+        # Dequeue next waiting customer — gated
+        if cfg.features.queue:
+            await _dequeue_next(manager)
 
     elif cmd == "history":
         limit = int(args[0]) if args else 20
@@ -857,16 +863,23 @@ async def handle_agent_command(
                 text = m["content"][:80]
                 lines.append(f"{role} {m['timestamp']}: {text}")
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                 text="\n".join(lines),
             )
         else:
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                 text="暂无历史消息。",
             )
 
     elif cmd == "report":
+        if not cfg.features.reports:
+            await tg._app.bot.send_message(
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
+                text="⚠️ 报表功能已关闭。",
+            )
+            return
+
         date = args[0] if args else None
         report = store.daily_report(date)
         avg_reply = f"{report['avg_first_reply_seconds']}s" if report['avg_first_reply_seconds'] else "N/A"
@@ -884,11 +897,18 @@ async def handle_agent_command(
                 lines.append(f"  • {a['assigned_agent']}: {a['sessions']}会话 / {a['replies']}回复")
 
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+            chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
             text="\n".join(lines),
         )
 
     elif cmd == "hotwords":
+        if not cfg.features.reports:
+            await tg._app.bot.send_message(
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
+                text="⚠️ 报表功能已关闭。",
+            )
+            return
+
         days = int(args[0]) if args else 7
         keywords = store.hot_keywords(days=days)
         if keywords:
@@ -896,19 +916,26 @@ async def handle_agent_command(
             for i, (word, count) in enumerate(keywords, 1):
                 lines.append(f"{i}. {word} ({count}次)")
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                 text="\n".join(lines),
             )
         else:
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                 text="暂无数据。",
             )
 
     elif cmd == "queue":
+        if not cfg.features.queue:
+            await tg._app.bot.send_message(
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
+                text="⚠️ 排队功能已关闭。",
+            )
+            return
+
         if not waiting_queue:
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                 text="📭 当前排队为空。",
             )
         else:
@@ -918,39 +945,39 @@ async def handle_agent_command(
                 name = (db_sess.get("user_name") or db_sess.get("user_id") or sid[:8]) if db_sess else sid[:8]
                 lines.append(f"{i}. {name} (`{sid[:8]}…`)")
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                 text="\n".join(lines), parse_mode="Markdown",
             )
 
     elif cmd == "transfer":
         if not args:
             await tg._app.bot.send_message(
-                chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                 text="⚠️ 请指定目标客服: `/transfer <agent_name>`",
                 parse_mode="Markdown",
             )
         else:
             target_agent = args[0]
-            if AGENTS and target_agent not in AGENTS:
+            if cfg.agents and target_agent not in cfg.agents:
                 await tg._app.bot.send_message(
-                    chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
-                    text=f"⚠️ 客服「{target_agent}」不存在。可选: {', '.join(AGENTS)}",
+                    chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
+                    text=f"⚠️ 客服「{target_agent}」不存在。可选: {', '.join(cfg.agents)}",
                 )
             else:
                 old_agent = store.get_assigned_agent(session_id) or "未分配"
                 store.set_assigned_agent(session_id, target_agent)
 
                 await tg._app.bot.send_message(
-                    chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
-                    text=f"🔀 会话已转接: {old_agent} → {target_agent}",
+                    chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
+                    text=f"🔀 会话已转接: {old_agent} -> {target_agent}",
                 )
 
-                # Notify customer
+                # Notify customer — translate if needed
                 user_ch = _find_user_channel(manager, session_id)
                 if user_ch:
                     user_lang = store.get_user_lang(session_id)
                     transfer_msg = "您的会话已转接给其他客服，请稍候。"
-                    if user_lang != "zh" and router.get_backend("translate"):
+                    if cfg.features.translation and user_lang != "zh" and router.get_backend("translate"):
                         transfer_msg = await translate_text(transfer_msg, user_lang, "zh")
                     await user_ch.send(OutboundMessage(chat_id=session_id, text=transfer_msg))
 
@@ -962,33 +989,52 @@ async def handle_agent_command(
         else:
             translate_status = "未配置 (设置 MINIMAX_API_KEY 或 OPENAI_API_KEY)"
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+            chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
             text=f"🌐 用户语言: {user_lang}\n翻译: {translate_status}",
         )
 
     elif cmd == "help":
-        await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
-            text=(
-                "📖 客服命令:\n\n"
-                "**查询**\n"
-                "• `/erp [ID]` — ERP 用户信息\n"
-                "• `/order [手机/ID]` — 订单查询\n"
-                "• `/history [N]` — 聊天记录\n"
-                "• `/lang` — 用户语言\n\n"
-                "**操作**\n"
-                "• `/tpl [名称]` — 快捷回复模板\n"
-                "• `/ticket 标题` — 创建工单\n"
-                "• `/transfer <客服>` — 转接会话\n"
-                "• `/close` — 关闭会话+评价\n"
-                "• `/queue` — 查看排队用户\n\n"
-                "**报表**\n"
-                "• `/report [日期]` — 日报统计\n"
-                "• `/hotwords [天数]` — 热词分析\n\n"
-                "💡 翻译自动进行，无需手动操作"
-            ),
-            parse_mode="Markdown",
-        )
+        await _send_help(tg, topic_id)
+
+
+async def _send_help(tg: TelegramAdapter, topic_id: int) -> None:
+    """Build /help output dynamically based on enabled features."""
+    lines = ["📖 客服命令:\n", "**查询**"]
+    lines.append("• `/erp [ID]` — ERP 用户信息")
+    lines.append("• `/order [手机/ID]` — 订单查询")
+    lines.append("• `/history [N]` — 聊天记录")
+
+    if cfg.features.translation:
+        lines.append("• `/lang` — 用户语言")
+
+    lines.append("\n**操作**")
+
+    if cfg.features.templates:
+        lines.append("• `/tpl [名称]` — 快捷回复模板")
+    if cfg.features.tickets:
+        lines.append("• `/ticket 标题` — 创建工单")
+
+    lines.append("• `/transfer <客服>` — 转接会话")
+    lines.append("• `/close` — 关闭会话" + ("+评价" if cfg.features.ratings else ""))
+
+    if cfg.features.queue:
+        lines.append("• `/queue` — 查看排队用户")
+
+    if cfg.features.reports:
+        lines.append("\n**报表**")
+        lines.append("• `/report [日期]` — 日报统计")
+        lines.append("• `/hotwords [天数]` — 热词分析")
+
+    if cfg.features.translation:
+        lines.append("\n💡 翻译自动进行，无需手动操作")
+
+    assert tg._app
+    await tg._app.bot.send_message(
+        chat_id=int(cfg.support_group_id),
+        message_thread_id=topic_id,
+        text="\n".join(lines),
+        parse_mode="Markdown",
+    )
 
 
 # =============================================================================
@@ -996,6 +1042,9 @@ async def handle_agent_command(
 # =============================================================================
 
 async def handle_callback(manager: ChannelManager, msg: UnifiedMessage) -> None:
+    if not cfg.features.ratings:
+        return
+
     data = msg.content.callback_data or ""
     if data.startswith("rate:"):
         parts = data.split(":")
@@ -1008,7 +1057,7 @@ async def handle_callback(manager: ChannelManager, msg: UnifiedMessage) -> None:
             if user_ch:
                 user_lang = store.get_user_lang(session_id)
                 thanks = "感谢您的评价！祝您生活愉快！"
-                if user_lang != "zh" and router.get_backend("translate"):
+                if cfg.features.translation and user_lang != "zh" and router.get_backend("translate"):
                     thanks = await translate_text(thanks, user_lang, "zh")
                 await user_ch.send(OutboundMessage(
                     chat_id=session_id, text=f"{'⭐' * score} {thanks}",
@@ -1019,7 +1068,7 @@ async def handle_callback(manager: ChannelManager, msg: UnifiedMessage) -> None:
                 tg = manager._channels["telegram"]
                 assert isinstance(tg, TelegramAdapter) and tg._app
                 await tg._app.bot.send_message(
-                    chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+                    chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
                     text=f"⭐ 用户评价: {score}/5 {'⭐' * score}",
                 )
 
@@ -1029,18 +1078,22 @@ async def handle_callback(manager: ChannelManager, msg: UnifiedMessage) -> None:
 # =============================================================================
 
 async def notify_user_online(manager: ChannelManager, session_id: str) -> None:
+    if not cfg.features.online_status:
+        return
     if session_id not in session_to_topic:
         return
     topic_id = session_to_topic[session_id]
     tg = manager._channels["telegram"]
     assert isinstance(tg, TelegramAdapter) and tg._app
     await tg._app.bot.send_message(
-        chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+        chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
         text="🟢 用户已上线",
     )
 
 
 async def notify_user_offline(manager: ChannelManager, session_id: str) -> None:
+    if not cfg.features.online_status:
+        return
     if session_id not in session_to_topic:
         return
     topic_id = session_to_topic[session_id]
@@ -1048,7 +1101,7 @@ async def notify_user_offline(manager: ChannelManager, session_id: str) -> None:
     assert isinstance(tg, TelegramAdapter) and tg._app
     try:
         await tg._app.bot.send_message(
-            chat_id=int(SUPPORT_GROUP_ID), message_thread_id=topic_id,
+            chat_id=int(cfg.support_group_id), message_thread_id=topic_id,
             text="🔴 用户已离线",
         )
     except Exception:
@@ -1056,6 +1109,8 @@ async def notify_user_offline(manager: ChannelManager, session_id: str) -> None:
 
 
 async def send_history(manager: ChannelManager, session_id: str) -> None:
+    if not cfg.features.history:
+        return
     messages = store.get_unseen_messages(session_id, limit=50)
     if not messages:
         return
@@ -1128,21 +1183,21 @@ async def main() -> None:
 
     manager = ChannelManager()
 
-    webchat = WebChatAdapter(port=WEBCHAT_PORT)
-    wkim = WKIMCompatAdapter(port=WKIM_PORT)
-    telegram = TelegramAdapter(token=TELEGRAM_TOKEN)
+    webchat = WebChatAdapter(port=cfg.webchat_port)
+    wkim = WKIMCompatAdapter(port=cfg.wkim_port)
+    telegram = TelegramAdapter(token=cfg.telegram_token)
 
     manager.add_channel(webchat)
     manager.add_channel(wkim)
     manager.add_channel(telegram)
 
-    # --- Group access control: auto-kick unauthorized members ---
-    if ALLOWED_AGENTS:
+    # --- Group access control: auto-kick unauthorized members --- (gated)
+    if cfg.features.access_control and cfg.allowed_agent_ids:
         from telegram.ext import ChatMemberHandler
 
         async def _on_chat_member(update, context):
             """Kick users who join the support group but aren't on the allowed list."""
-            if not update.chat_member or str(update.chat_member.chat.id) != SUPPORT_GROUP_ID:
+            if not update.chat_member or str(update.chat_member.chat.id) != cfg.support_group_id:
                 return
             new = update.chat_member.new_chat_member
             if not new or new.status in ("left", "kicked"):
@@ -1151,13 +1206,13 @@ async def main() -> None:
             bot_id = str((await telegram._app.bot.get_me()).id)
             if user_id == bot_id:
                 return
-            if user_id not in ALLOWED_AGENTS:
+            if user_id not in cfg.allowed_agent_ids:
                 try:
                     await telegram._app.bot.ban_chat_member(
-                        chat_id=int(SUPPORT_GROUP_ID), user_id=int(user_id),
+                        chat_id=int(cfg.support_group_id), user_id=int(user_id),
                     )
                     await telegram._app.bot.unban_chat_member(
-                        chat_id=int(SUPPORT_GROUP_ID), user_id=int(user_id),
+                        chat_id=int(cfg.support_group_id), user_id=int(user_id),
                     )
                     logger.warning("kicked unauthorized user %s (%s) from support group",
                                    user_id, new.user.full_name)
@@ -1165,7 +1220,7 @@ async def main() -> None:
                     logger.error("failed to kick user %s: %s", user_id, e)
 
         telegram._app.add_handler(ChatMemberHandler(_on_chat_member, ChatMemberHandler.CHAT_MEMBER))
-        logger.info("group access control enabled: %d allowed agents", len(ALLOWED_AGENTS))
+        logger.info("group access control enabled: %d allowed agents", len(cfg.allowed_agent_ids))
 
     @manager.on_message
     async def route(msg: UnifiedMessage) -> None:
@@ -1178,12 +1233,12 @@ async def main() -> None:
             key = msg.chat_id or "unknown"
             await _msg_queue.run(key, forward_to_telegram(manager, msg))
         elif msg.channel == "telegram":
-            if msg.chat_id == SUPPORT_GROUP_ID:
-                # Check agent authorization
-                if ALLOWED_AGENTS and msg.sender.id not in ALLOWED_AGENTS:
+            if msg.chat_id == cfg.support_group_id:
+                # Check agent authorization — gated
+                if cfg.features.access_control and cfg.allowed_agent_ids and msg.sender.id not in cfg.allowed_agent_ids:
                     logger.warning("ignored message from unauthorized user %s in support group", msg.sender.id)
                     return
-                # Serialize per-session: use thread_id → session_id as key
+                # Serialize per-session: use thread_id -> session_id as key
                 key = topic_to_session.get(int(msg.thread_id)) if msg.thread_id else None
                 if key:
                     await _msg_queue.run(key, forward_to_user(manager, msg))
@@ -1199,6 +1254,7 @@ async def main() -> None:
         sid = item.chat_id
         if sid and sid not in first_message_sent:
             first_message_sent.add(sid)
+            # online_status and history are gated inside their functions
             asyncio.create_task(notify_user_online(manager, sid))
             asyncio.create_task(send_history(manager, sid))
 
@@ -1211,23 +1267,26 @@ async def main() -> None:
     await telegram.connect()
 
     # --- Health monitor: auto-reconnect stale channels ---
-    health_interval = int(os.environ.get("CS_HEALTH_INTERVAL", "30"))
-    health_monitor = HealthMonitor(interval=health_interval)
+    health_monitor = HealthMonitor(interval=cfg.health_interval)
     await health_monitor.start(manager)
 
+    # --- Startup log ---
     logger.info("=" * 60)
     logger.info("Customer Service POC started! (full-featured)")
-    logger.info("  Web chat:    http://localhost:%d/chat", WEBCHAT_PORT)
-    logger.info("  WuKongIM:    http://localhost:%d", WKIM_PORT)
-    logger.info("  Telegram:    group %s", SUPPORT_GROUP_ID)
-    logger.info("  DB:          %s", DB_PATH)
-    logger.info("  AI FAQ:      %s", "on" if AI_ENABLED else "off")
-    logger.info("  Timeout:     %ds", REPLY_TIMEOUT_SECONDS)
-    logger.info("  Health:      every %ds", health_interval)
-    logger.info("  Agents:      %s", AGENTS or "(auto-assign off)")
-    logger.info("  Max/agent:   %d sessions", MAX_SESSIONS_PER_AGENT)
-    logger.info("  Access:      %s", f"{len(ALLOWED_AGENTS)} allowed agents" if ALLOWED_AGENTS else "open (anyone in group can reply)")
+    logger.info("  Web chat:    http://localhost:%d/chat", cfg.webchat_port)
+    logger.info("  WuKongIM:    http://localhost:%d", cfg.wkim_port)
+    logger.info("  Telegram:    group %s", cfg.support_group_id)
+    logger.info("  DB:          %s", cfg.db_path)
+    logger.info("  Timeout:     %ds", cfg.reply_timeout)
+    logger.info("  Health:      every %ds", cfg.health_interval)
+    logger.info("  Agents:      %s", cfg.agents or "(auto-assign off)")
+    logger.info("  Max/agent:   %d sessions", cfg.max_sessions_per_agent)
+    logger.info("  Access:      %s",
+                f"{len(cfg.allowed_agent_ids)} allowed agents" if cfg.features.access_control and cfg.allowed_agent_ids
+                else "open (anyone in group can reply)")
     logger.info("  Restored:    %d sessions", len(s2t))
+    for line in cfg.summary():
+        logger.info("  %s", line)
     logger.info("  Model Router:")
     for line in router.summary():
         logger.info("    %s", line)
