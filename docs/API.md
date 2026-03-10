@@ -1,586 +1,657 @@
-# Unified Support API Reference
+# API 对接文档
 
-Base URL: `http://localhost:8081`
+AI Customer Support 系统提供以下 API 接口，用于前端集成、数据查询和业务系统对接。
 
-## Architecture
-
-```
-Browser/App ──WebSocket──→ WebChat Adapter ──→ ChannelManager ──→ AI / Agent
-                                                     ↑
-Telegram/WeChat/... ──→ IM Adapters ────────────────┘
-                                                     ↓
-Dashboard (Agent UI) ←── REST + WebSocket ←── DashboardAPI
-```
-
-The system exposes two independent servers:
-
-| Server | Default Port | Purpose |
-|--------|-------------|---------|
-| **WebChat** | 8081 `/ws` | Customer-facing WebSocket chat |
-| **Dashboard** | 8081 `/api/*` | Agent-facing REST + WebSocket |
-
-> In production, separate ports via config. Both default to 8081 for the POC.
+基础地址: `http://localhost:8081`（WebChat 端口，Dashboard API 共用同一端口）
 
 ---
 
-## 1. WebChat (Customer-Facing)
+## 目录
 
-WebSocket endpoint for anonymous or authenticated browser chat.
+- [1. WebSocket 聊天协议](#1-websocket-聊天协议)
+- [2. Dashboard REST API](#2-dashboard-rest-api)
+- [3. 二维码与渠道选择页](#3-二维码与渠道选择页)
+- [4. IM 渠道接入配置](#4-im-渠道接入配置)
+- [5. ERP / 业务系统对接](#5-erp--业务系统对接)
+- [6. WebChat 嵌入集成](#6-webchat-嵌入集成)
+- [7. 完整环境变量参考](#7-完整环境变量参考)
 
-### Connect
+---
+
+## 1. WebSocket 聊天协议
+
+WebChat 前端通过 WebSocket 与 Gateway 通信。
+
+### 连接
 
 ```
-ws://HOST:PORT/ws
-ws://HOST:PORT/ws?user_id=C10086&name=张三&phone=138xxxx
+ws://{host}:{port}/ws[?params]
 ```
 
-| Query Param | Required | Description |
-|-------------|----------|-------------|
-| `user_id` | No | Platform user ID (authenticated mode) |
-| `name` | No | Display name |
-| `phone` | No | Phone number |
+**URL 参数（可选）：**
 
-On connect, server sends:
+| 参数 | 说明 |
+|------|------|
+| `user_id` | 已登录用户 ID（传入后话题显示用户名，支持 ERP 查询） |
+| `name` | 用户显示名称 |
+| `phone` | 用户手机号 |
+| `session_id` | 恢复匿名会话（从 `localStorage` 读取） |
+
+**示例：**
+
+```javascript
+// 匿名用户
+const ws = new WebSocket("ws://localhost:8081/ws");
+
+// 已登录用户
+const ws = new WebSocket("ws://localhost:8081/ws?user_id=C10086&name=张三&phone=13800138000");
+```
+
+### 客户端 → 服务端
+
+#### 发送文本
 
 ```json
-{
-  "type": "system",
-  "text": "connected",
-  "session_id": "abc123def456",
-  "user_type": "anonymous"
-}
+{ "type": "text", "text": "你好，我想查询订单" }
 ```
 
-### Wire Protocol (JSON over WebSocket)
-
-#### Client → Server
-
-**Send text message:**
-
-```json
-{ "type": "text", "text": "How do I reset my password?" }
-```
-
-**Send media (base64):**
+#### 发送媒体（图片/视频/语音/文档）
 
 ```json
 {
   "type": "media",
   "media_type": "image",
-  "data": "data:image/png;base64,iVBOR...",
-  "text": "Here is my screenshot"
+  "data": "data:image/jpeg;base64,/9j/4AAQ...",
+  "text": "",
+  "filename": "photo.jpg"
 }
 ```
 
-**Upgrade to authenticated user (optional, post-connect):**
+`media_type` 枚举:
+
+| 值 | 说明 | 格式 |
+|----|------|------|
+| `image` | 图片 | jpg, png, gif, webp |
+| `video` | 视频 | mp4, webm, mov |
+| `voice` | 语音 | ogg, mp3, wav, m4a |
+| `document` | 文档 | pdf, doc, docx, xls, xlsx, ppt, pptx, txt, zip |
+
+#### 身份认证（连接后动态绑定）
 
 ```json
 {
   "type": "auth",
   "user_id": "C10086",
   "name": "张三",
-  "phone": "138xxxx",
-  "extra": { "vip_level": 3 }
+  "phone": "13800138000"
 }
 ```
 
-Server responds:
+#### 回调（评分）
 
 ```json
-{ "type": "system", "text": "authenticated", "user_type": "authenticated" }
+{ "type": "callback", "callback_data": "rate:session_abc:5" }
 ```
 
-#### Server → Client
+### 服务端 → 客户端
 
-**Text reply:**
+#### 系统消息
+
+```json
+{
+  "type": "system",
+  "text": "connected",
+  "session_id": "abc123",
+  "user_type": "authenticated"
+}
+```
+
+`text` 枚举: `connected`（初次连接）, `authenticated`（身份验证成功）
+
+#### 文本消息（客服回复）
+
+```json
+{ "type": "text", "text": "您好，请提供订单号" }
+```
+
+#### 带按钮消息（评分）
 
 ```json
 {
   "type": "text",
-  "text": "To reset your password, go to Settings > Security > Reset Password.",
-  "id": "a1b2c3d4",
-  "timestamp": "2026-03-09T14:30:00.000000"
+  "text": "请为本次服务评分：",
+  "buttons": [[
+    {"label": "⭐", "callback_data": "rate:sess_id:1"},
+    {"label": "⭐⭐", "callback_data": "rate:sess_id:2"},
+    {"label": "⭐⭐⭐", "callback_data": "rate:sess_id:3"},
+    {"label": "⭐⭐⭐⭐", "callback_data": "rate:sess_id:4"},
+    {"label": "⭐⭐⭐⭐⭐", "callback_data": "rate:sess_id:5"}
+  ]]
 }
 ```
 
-**Media reply:**
+#### 媒体消息
 
 ```json
 {
   "type": "media",
+  "text": "这是截图",
+  "url": "https://api.telegram.org/file/bot.../photo.jpg",
   "media_type": "image",
-  "url": "https://cdn.example.com/guide.png",
-  "text": "Follow this guide",
-  "id": "e5f6g7h8",
-  "timestamp": "2026-03-09T14:30:05.000000"
+  "filename": "screenshot.png"
 }
 ```
 
-### Health Check
-
-```
-GET /health
-```
-
-```json
-{ "status": "ok", "sessions": 3 }
-```
-
----
-
-## 2. Dashboard API (Agent-Facing)
-
-REST endpoints for the agent dashboard. All responses are JSON.
-
-### 2.1 Tickets
-
-#### List tickets
-
-```
-GET /api/tickets?status=open&channel=telegram&limit=50&offset=0
-```
-
-| Query Param | Required | Values |
-|-------------|----------|--------|
-| `status` | No | `open`, `escalated`, `assigned`, `resolved`, `closed` |
-| `channel` | No | `telegram`, `webchat`, `whatsapp`, `wechat`, `line`, etc. |
-| `limit` | No | Default `50` |
-| `offset` | No | Default `0` |
-
-**Response** `200`:
-
-```json
-[
-  {
-    "id": "a1b2c3d4e5f6",
-    "channel": "telegram",
-    "customer_name": "张三",
-    "subject": "Password reset",
-    "status": "open",
-    "priority": "normal",
-    "assigned_agent_id": null,
-    "created_at": "2026-03-09T10:00:00+00:00",
-    "updated_at": "2026-03-09T10:05:00+00:00"
-  }
-]
-```
-
-#### Get ticket detail
-
-```
-GET /api/tickets/{id}
-```
-
-**Response** `200`:
+#### 历史消息（重连后推送）
 
 ```json
 {
-  "id": "a1b2c3d4e5f6",
-  "channel": "telegram",
-  "chat_id": "123456789",
-  "customer_id": "C10086",
-  "customer_name": "张三",
-  "subject": "Password reset",
-  "status": "escalated",
-  "priority": "high",
-  "assigned_agent_id": "agent-1",
-  "language": "zh",
-  "created_at": "2026-03-09T10:00:00+00:00",
-  "updated_at": "2026-03-09T10:15:00+00:00",
-  "resolved_at": null
+  "type": "history",
+  "messages": [
+    {
+      "sender": "user",
+      "text": "你好",
+      "media_url": null,
+      "media_type": null,
+      "timestamp": "2026-03-10 14:30:00"
+    },
+    {
+      "sender": "agent",
+      "text": "您好，有什么可以帮您？",
+      "media_url": null,
+      "media_type": null,
+      "timestamp": "2026-03-10 14:30:15"
+    }
+  ]
 }
 ```
 
-**Response** `404`:
+#### 未读通知
 
 ```json
-{ "error": "not found" }
+{ "type": "unseen_notice", "count": 3 }
 ```
 
-#### Get ticket messages
-
-```
-GET /api/tickets/{id}/messages
-```
-
-**Response** `200`:
+#### 输入状态
 
 ```json
-[
-  {
-    "id": 1,
-    "role": "customer",
-    "sender_name": "张三",
-    "content": "I can't reset my password",
-    "channel": "telegram",
-    "created_at": "2026-03-09T10:00:00+00:00"
-  },
-  {
-    "id": 2,
-    "role": "ai",
-    "sender_name": null,
-    "content": "Please go to Settings > Security...",
-    "channel": null,
-    "created_at": "2026-03-09T10:00:02+00:00"
-  },
-  {
-    "id": 3,
-    "role": "agent",
-    "sender_name": null,
-    "content": "Let me check your account directly.",
-    "channel": null,
-    "created_at": "2026-03-09T10:10:00+00:00"
-  }
-]
+{ "type": "typing" }
 ```
 
-Message roles: `customer` | `ai` | `agent`
-
-#### Reply to ticket (as agent)
+### 连接生命周期
 
 ```
-POST /api/tickets/{id}/reply
-Content-Type: application/json
-
-{ "text": "I've reset your password. Please check your email." }
+客户端                           服务端
+  │                                │
+  ├─ WebSocket connect ──────────► │  分配 session_id
+  │◄──── {type:"system"} ──────── │
+  │                                │
+  ├─ {type:"text"} ──────────────► │  转发到 Telegram 话题
+  │                                │
+  │◄── {type:"text"} ───────────── │  客服回复
+  │                                │
+  │  (断线重连)                     │
+  ├─ ws://host/ws?session_id=xxx ► │
+  │◄── {type:"unseen_notice"} ──── │
+  │◄── {type:"history"} ────────── │
 ```
 
-**Response** `200`:
+---
 
-```json
-{ "ok": true }
-```
+## 2. Dashboard REST API
 
-The reply is sent to the customer via their original IM channel and stored in message history.
+所有接口返回 JSON，挂载在 WebChat 同一端口。
 
-#### Resolve ticket
+### GET /api/sessions
 
-```
-POST /api/tickets/{id}/resolve
-```
+获取所有活跃会话列表。
 
-**Response** `200`:
-
-```json
-{ "ok": true }
-```
-
-Sets ticket status to `resolved` and sends a resolution message to the customer.
-
-### 2.2 Agents
-
-#### List agents
-
-```
-GET /api/agents
-```
-
-**Response** `200`:
-
-```json
-[
-  {
-    "id": "agent-1",
-    "name": "Support Team",
-    "status": "online",
-    "current_load": 2,
-    "max_concurrent": 5,
-    "channel": "telegram"
-  }
-]
-```
-
-Agent statuses: `online` | `offline` | `busy`
-
-### 2.3 Analytics
-
-#### Get summary
-
-```
-GET /api/analytics
-```
-
-Returns aggregate stats (ticket counts, response times, CSAT scores, etc.).
-
-### 2.4 Customer Identity Binding
-
-Enables "scan QR code with your own IM" flow. Your platform generates personalized links; when the customer clicks/scans, their IM account gets bound to their platform user ID.
-
-#### Get connect links
-
-```
-GET /api/connect-links/{uid}?tg_bot=MyBot&wa_number=1234567890&line_id=@myline
-```
-
-| Path Param | Description |
-|-----------|-------------|
-| `uid` | Your platform's user ID |
-
-| Query Param | Description |
-|-------------|-------------|
-| `tg_bot` | Telegram bot username |
-| `wa_number` | WhatsApp business number |
-| `line_id` | LINE Official Account ID |
-
-**Response** `200`:
+**响应：**
 
 ```json
 {
-  "uid": "USER123",
-  "links": {
-    "telegram": "https://t.me/MyBot?start=uid_USER123",
-    "whatsapp": "https://wa.me/1234567890?text=uid_USER123",
-    "line": "https://line.me/R/oaMessage/@myline/?uid_USER123",
-    "universal": "/connect.html?uid=USER123"
-  }
+  "sessions": [
+    {
+      "session_id": "abc123",
+      "channel": "webchat",
+      "user_type": "authenticated",
+      "user_id": "C10086",
+      "user_name": "张三",
+      "user_phone": "13800138000",
+      "assigned_agent": "alice",
+      "topic_id": 42,
+      "created_at": "2026-03-10 14:00:00",
+      "closed_at": null,
+      "first_reply_at": "2026-03-10 14:01:30",
+      "has_topic": true
+    }
+  ],
+  "count": 1
 }
 ```
 
-Each link can be rendered as a QR code on your web/app. When the customer scans with their IM app, the `IdentityMiddleware` auto-binds the IM identity to the platform user.
+### GET /api/sessions/{session_id}
 
-**Binding flow:**
+获取单个会话详情 + 消息记录 + 评分 + 工单。
 
-```
-Your App                    IM (Telegram/WeChat/...)         Support System
-  │                                │                              │
-  ├─ GET /api/connect-links/U123   │                              │
-  │◄─ { telegram: "t.me/...?start=uid_U123" }                    │
-  │                                │                              │
-  ├─ Show QR code to user ────────►│                              │
-  │                                ├─ /start uid_U123 ──────────►│
-  │                                │                    IdentityMiddleware
-  │                                │                    binds telegram:9876 → U123
-  │                                │◄─ "Welcome! Account linked." │
-  │                                │                              │
-  │                                ├─ "I need help with..." ────►│
-  │                                │              (tagged as U123) │
-```
+**参数：**
 
-#### Get user bindings
+| 参数 | 位置 | 默认值 | 说明 |
+|------|------|--------|------|
+| `session_id` | path | — | 会话 ID |
+| `limit` | query | 50 | 返回消息条数 |
 
-```
-GET /api/user/{uid}/bindings
-```
-
-**Response** `200`:
+**响应 200：**
 
 ```json
-[
-  {
-    "channel": "telegram",
-    "chat_id": "987654321",
-    "bound_at": "2026-03-09T08:00:00+00:00"
+{
+  "session": {
+    "session_id": "abc123",
+    "channel": "webchat",
+    "user_type": "authenticated",
+    "user_id": "C10086",
+    "user_name": "张三",
+    "assigned_agent": "alice",
+    "created_at": "2026-03-10 14:00:00",
+    "closed_at": null
   },
-  {
-    "channel": "whatsapp",
-    "chat_id": "8613800138000",
-    "bound_at": "2026-03-09T09:30:00+00:00"
-  }
-]
+  "messages": [
+    {
+      "id": 1,
+      "sender": "user",
+      "content": "你好，我想查询订单",
+      "media_url": null,
+      "media_type": null,
+      "timestamp": "2026-03-10 14:00:05"
+    },
+    {
+      "id": 2,
+      "sender": "agent",
+      "content": "您好，请提供订单号",
+      "media_url": null,
+      "media_type": null,
+      "timestamp": "2026-03-10 14:01:30"
+    }
+  ],
+  "rating": { "score": 5, "created_at": "2026-03-10 14:30:00" },
+  "tickets": [
+    { "id": 1, "title": "退货问题", "status": "open", "created_by": "alice", "created_at": "2026-03-10 14:10:00" }
+  ]
+}
 ```
 
-### 2.5 WebSocket (Real-time Events)
-
-```
-ws://HOST:PORT/ws
-```
-
-> Note: This is the **dashboard** WebSocket, separate from the WebChat `/ws`. In production, use different ports.
-
-Server pushes events as JSON:
-
-**New message on a ticket:**
+**响应 404：**
 
 ```json
-{ "type": "message", "ticket_id": "a1b2c3d4e5f6" }
+{"error": "session not found"}
 ```
 
-**Ticket resolved:**
+### GET /api/report
+
+获取日报统计。
+
+**参数：**
+
+| 参数 | 位置 | 默认值 | 说明 |
+|------|------|--------|------|
+| `date` | query | 今天 | 格式 `YYYY-MM-DD` |
+
+**响应：**
 
 ```json
-{ "type": "resolved", "ticket_id": "a1b2c3d4e5f6" }
+{
+  "date": "2026-03-10",
+  "total_sessions": 42,
+  "closed_sessions": 38,
+  "total_messages": 256,
+  "avg_rating": 4.6,
+  "avg_first_reply_seconds": 45,
+  "agents": [
+    {"assigned_agent": "alice", "sessions": 15, "replies": 80},
+    {"assigned_agent": "bob", "sessions": 12, "replies": 65}
+  ]
+}
+```
+
+### GET /api/hotwords
+
+获取热门关键词。
+
+**参数：**
+
+| 参数 | 位置 | 默认值 | 说明 |
+|------|------|--------|------|
+| `days` | query | 7 | 统计天数 |
+| `top` | query | 20 | 返回 Top N |
+
+**响应：**
+
+```json
+{
+  "days": 7,
+  "keywords": [
+    {"word": "退货", "count": 28},
+    {"word": "发货", "count": 22},
+    {"word": "订单", "count": 18}
+  ]
+}
+```
+
+### GET /api/agents/load
+
+获取客服负载。
+
+**响应：**
+
+```json
+{
+  "agents": [
+    {"name": "alice", "active_sessions": 3},
+    {"name": "bob", "active_sessions": 5}
+  ],
+  "configured_agents": ["alice", "bob", "charlie"],
+  "max_per_agent": 5
+}
+```
+
+### GET /api/queue
+
+获取等待队列。
+
+**响应：**
+
+```json
+{
+  "queue": [
+    {
+      "session_id": "xyz789",
+      "user_name": "李四",
+      "user_id": "C10087",
+      "created_at": "2026-03-10 15:00:00"
+    }
+  ],
+  "count": 1
+}
 ```
 
 ---
 
-## 3. Identity Binding Patterns
+## 3. 二维码与渠道选择页
 
-The `IdentityMiddleware` recognizes these patterns in incoming messages to auto-bind:
+系统提供**统一二维码**入口。用户扫一个码，选择自己常用的 IM 渠道开始对话。
 
-| Pattern | Example | Source |
-|---------|---------|--------|
-| `/start uid_XXX` | `/start uid_USER123` | Telegram deep link |
-| `/start XXX` | `/start USER123` | Telegram (any payload) |
-| `uid_XXX` / `uid:XXX` / `uid=XXX` | `uid_USER123` | WhatsApp / LINE first message |
-| `bind XXX` | `bind USER123` | Explicit bind command |
+### GET /qr
+
+生成二维码图片，指向 `/connect` 渠道选择页。
+
+**参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `format` | svg | `svg` 或 `png` |
+| `scale` | 8 | 缩放倍数 |
+
+```bash
+# SVG（适合网页）
+curl http://localhost:8081/qr -o connect.svg
+
+# PNG（适合打印）
+curl "http://localhost:8081/qr?format=png&scale=10" -o connect.png
+```
+
+### GET /connect
+
+渠道选择落地页。自动列出所有已启用渠道的按钮：
+
+- **Telegram** → `https://t.me/{bot_username}`
+- **Web Chat** → `/chat`
+- **WhatsApp** → `https://wa.me/{phone}`（需配 `CS_WA_PHONE_NUMBER`）
+- **LINE** → `https://line.me/R/oaMessage/{bot_id}`（需配 `CS_LINE_BOT_ID`）
+- 其他已配置渠道的深度链接
+
+**流程：**
+
+```
+二维码 ──► /connect 落地页 ──► 用户选择渠道
+                                ├── Telegram  → t.me/BOT
+                                ├── WhatsApp  → wa.me/PHONE
+                                ├── LINE      → line.me/...
+                                ├── Web Chat  → /chat
+                                └── ...
+```
+
+**环境变量：**
+
+| 变量 | 说明 |
+|------|------|
+| `CS_BASE_URL` | 公网基地址（反向代理时必设），如 `https://cs.example.com` |
 
 ---
 
-## 4. Data Models
+## 4. IM 渠道接入配置
 
-### Ticket
+支持 12 个 IM 渠道。设置对应环境变量即可自动启用，Gateway 启动时自动检测。
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | string | 12-char hex ID |
-| `channel` | string | Source channel |
-| `chat_id` | string | Channel-specific conversation ID |
-| `customer_id` | string | Platform user ID (if bound) |
-| `customer_name` | string? | Display name |
-| `subject` | string? | Auto-extracted topic |
-| `status` | enum | `open` → `escalated` → `assigned` → `resolved` → `closed` |
-| `priority` | enum | `low`, `normal`, `high`, `urgent` |
-| `assigned_agent_id` | string? | Assigned human agent |
-| `language` | string? | Detected language |
-| `created_at` | ISO 8601 | |
-| `updated_at` | ISO 8601 | |
-| `resolved_at` | ISO 8601? | |
+### 渠道列表
 
-### Ticket lifecycle
+| 渠道 | 环境变量前缀 | 必填 Key | 可选 Key | 默认端口 |
+|------|-------------|----------|----------|---------|
+| WhatsApp | `CS_WA_` | `ACCESS_TOKEN`, `PHONE_NUMBER_ID`, `VERIFY_TOKEN` | `APP_SECRET`, `PORT`, `PHONE_NUMBER` | 8443 |
+| LINE | `CS_LINE_` | `CHANNEL_SECRET`, `CHANNEL_ACCESS_TOKEN` | `PORT` | 8044 |
+| Discord | `CS_DISCORD_` | `TOKEN` | — | — |
+| Slack | `CS_SLACK_` | `BOT_TOKEN`, `APP_TOKEN` | — | — |
+| WeChat (Enterprise) | `CS_WECHAT_` | `CORP_ID`, `CORP_SECRET`, `AGENT_ID` | `TOKEN`, `ENCODING_AES_KEY`, `PORT` | 9001 |
+| Feishu (Lark) | `CS_FEISHU_` | `APP_ID`, `APP_SECRET` | `VERIFICATION_TOKEN`, `ENCRYPT_KEY`, `PORT` | 9000 |
+| DingTalk | `CS_DINGTALK_` | `APP_KEY`, `APP_SECRET` | `WEBHOOK_URL`, `SECRET`, `PORT` | 9002 |
+| MS Teams | `CS_TEAMS_` | `APP_ID`, `APP_PASSWORD` | `PORT` | 3978 |
+| QQ | `CS_QQ_` | `APP_ID`, `TOKEN` | `SECRET`, `SANDBOX` | — |
+| Matrix | `CS_MATRIX_` | `HOMESERVER`, `USER_ID` | `PASSWORD`, `ACCESS_TOKEN` | — |
+| Zalo | `CS_ZALO_` | `ACCESS_TOKEN` | `APP_SECRET`, `PORT` | 8060 |
+| iMessage | `CS_IMESSAGE_` | `ENABLED` | `ALLOWED_NUMBERS`, `POLL_INTERVAL` | — |
+
+### 配置示例
+
+```bash
+# .env
+
+# WhatsApp — Meta Business Cloud API
+CS_WA_ACCESS_TOKEN=EAAxxxxxxxxx
+CS_WA_PHONE_NUMBER_ID=1234567890
+CS_WA_VERIFY_TOKEN=my_verify_token
+CS_WA_PHONE_NUMBER=8613800138000
+
+# 飞书
+CS_FEISHU_APP_ID=cli_xxxxxxxx
+CS_FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
+
+# 企业微信
+CS_WECHAT_CORP_ID=wwxxxxxxxx
+CS_WECHAT_CORP_SECRET=xxxxxxxxxxxxxxxx
+CS_WECHAT_AGENT_ID=1000002
+
+# Discord
+CS_DISCORD_TOKEN=MTxxxxxxxx.xxxxxxxx.xxxxxxxx
+```
+
+### 深度链接（/connect 页面用）
+
+| 渠道 | 环境变量 | 链接格式 |
+|------|---------|---------|
+| WhatsApp | `CS_WA_PHONE_NUMBER` | `https://wa.me/{value}` |
+| LINE | `CS_LINE_BOT_ID` | `https://line.me/R/oaMessage/{value}` |
+
+### 交互式配置
+
+```bash
+ai-cs setup
+# Step 4/6 引导配置各渠道 API 凭据
+```
+
+### 架构
 
 ```
-Customer sends message
-        ↓
-   [TicketMiddleware] creates ticket (status: open)
-        ↓
-   [AI Router] auto-replies (up to max_ai_turns)
-        ↓
-   AI cannot resolve / customer requests human
-        ↓
-   [EscalationMiddleware] escalates (status: escalated)
-        ↓
-   Agent assigned (status: assigned)
-        ↓
-   Agent resolves via dashboard (status: resolved)
+.env 环境变量 ──► get_enabled_channels() ──► create_adapter() ──► ChannelManager
+                   自动检测                    约定式工厂             统一路由
 ```
 
-### Agent
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | string | Agent identifier |
-| `name` | string | Display name |
-| `status` | enum | `online`, `offline`, `busy` |
-| `channel` | string? | Agent's IM channel for notifications |
-| `chat_id` | string? | Agent's chat ID on that channel |
-| `max_concurrent` | int | Max concurrent tickets (default 5) |
-| `current_load` | int | Currently assigned tickets |
-| `skills` | string[] | Skill tags, e.g. `["billing", "tech"]` |
-
-### CustomerBinding
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `platform_user_id` | string | Your platform's user ID |
-| `channel` | string | IM channel name |
-| `chat_id` | string | Channel-specific user/chat ID |
-| `bound_at` | ISO 8601 | When the binding was created |
+添加新渠道只需在 `support/channels.py` 的 `CHANNELS` 列表加一个 `ChannelDef`。
 
 ---
 
-## 5. Sample Code
+## 5. ERP / 业务系统对接
 
-### 5.1 WebChat — Minimal Browser Client (JavaScript)
+客服使用 `/erp` 和 `/order` 命令时，系统调用你的 REST API。
+
+### 配置
+
+```bash
+CS_ERP_BACKEND=rest                        # mock(默认) | rest
+CS_ERP_BASE_URL=https://erp.example.com/api
+CS_ERP_API_KEY=your_api_key
+CS_ERP_TIMEOUT=5
+```
+
+### 你需要实现的接口
+
+#### GET /customer
+
+```
+GET {CS_ERP_BASE_URL}/customer?q={user_id_or_phone}
+Authorization: Bearer {CS_ERP_API_KEY}
+```
+
+**响应：**
+
+```json
+{
+  "id": "C10086",
+  "name": "张三",
+  "phone": "13800138000",
+  "level": "金牌",
+  "balance": 1500.00,
+  "created_at": "2025-01-15",
+  "tags": ["VIP", "电商"]
+}
+```
+
+#### GET /orders
+
+```
+GET {CS_ERP_BASE_URL}/orders?q={user_id_or_phone}&limit=5
+Authorization: Bearer {CS_ERP_API_KEY}
+```
+
+**响应：**
+
+```json
+{
+  "orders": [
+    {
+      "id": "#202603100001",
+      "amount": 299.00,
+      "status": "已发货",
+      "items": "iPhone 手机壳 x1",
+      "created_at": "2026-03-08",
+      "tracking": "SF1234567890"
+    }
+  ]
+}
+```
+
+### Mock 模式
+
+`CS_ERP_BACKEND=mock`（默认）使用内置模拟数据，无需 ERP 即可演示完整流程。
+
+---
+
+## 6. WebChat 嵌入集成
+
+### iframe 嵌入
+
+```html
+<iframe
+  src="https://cs.example.com/chat"
+  width="420" height="680"
+  style="border:none; border-radius:16px; box-shadow:0 4px 24px rgba(0,0,0,0.12);">
+</iframe>
+```
+
+### 传递用户身份
+
+三种方式（优先级递增）：
+
+#### 方式 1：URL 参数
+
+```html
+<iframe src="https://cs.example.com/chat?user_id=C10086&name=张三&phone=13800138000"></iframe>
+```
+
+#### 方式 2：JS 全局变量
 
 ```html
 <script>
-// Connect as authenticated user (or omit params for anonymous)
+window.CHAT_USER = { user_id: "C10086", name: "张三", phone: "13800138000" };
+</script>
+<iframe src="https://cs.example.com/chat"></iframe>
+```
+
+#### 方式 3：postMessage（动态绑定）
+
+```javascript
+const chatFrame = document.getElementById('chat-iframe');
+chatFrame.contentWindow.postMessage({
+  type: 'chat_user',
+  user_id: 'C10086',
+  name: '张三',
+  phone: '13800138000',
+  extra: { vip: true }
+}, '*');
+```
+
+### 身份传入效果
+
+| 能力 | 匿名 | 已登录 |
+|------|------|--------|
+| Telegram 话题标题 | `💬 访客_abc123` | `👤 张三` |
+| ERP 查询 | 不可用 | `/erp C10086` |
+| 跨设备恢复 | 同浏览器 (localStorage) | 任何设备 |
+
+### 代码示例
+
+#### 最小化 WebSocket 客户端
+
+```javascript
 const ws = new WebSocket('ws://localhost:8081/ws?user_id=C10086&name=张三');
-let sessionId = null;
 
 ws.onmessage = (e) => {
   const data = JSON.parse(e.data);
-
   switch (data.type) {
     case 'system':
-      sessionId = data.session_id;
-      console.log(`Connected: ${data.user_type} session=${sessionId}`);
+      console.log(`Connected: session=${data.session_id}`);
       break;
-
     case 'text':
-      appendMessage('agent', data.text);
+      console.log(`Agent: ${data.text}`);
       break;
-
     case 'media':
-      appendMedia(data.media_type, data.url, data.text);
+      console.log(`Agent media: ${data.media_type} ${data.url}`);
       break;
-
     case 'history':
-      // Reconnect: server sends previous messages
-      data.messages.forEach(m => {
-        appendMessage(m.sender === 'user' ? 'user' : 'agent', m.text);
-      });
+      data.messages.forEach(m => console.log(`[${m.sender}] ${m.text}`));
       break;
   }
 };
 
-// Send text
-function send(text) {
-  ws.send(JSON.stringify({ type: 'text', text }));
-  appendMessage('user', text);
-}
+// 发送文本
+ws.send(JSON.stringify({ type: 'text', text: '你好' }));
 
-// Send image from <input type="file">
-function sendImage(file) {
-  const reader = new FileReader();
-  reader.onload = () => {
-    ws.send(JSON.stringify({
-      type: 'media',
-      media_type: file.type.startsWith('video') ? 'video' : 'image',
-      data: reader.result,
-      text: '',
-    }));
-  };
-  reader.readAsDataURL(file);
-}
-
-// Upgrade anonymous → authenticated (post-connect)
-function authenticate(userId, name) {
-  ws.send(JSON.stringify({ type: 'auth', user_id: userId, name }));
-}
-
-// Rating callback (after /close)
-function submitRating(callbackData) {
-  ws.send(JSON.stringify({ type: 'callback', callback_data: callbackData }));
-}
-</script>
+// 发送图片
+ws.send(JSON.stringify({
+  type: 'media', media_type: 'image',
+  data: 'data:image/png;base64,...', text: ''
+}));
 ```
 
-### 5.2 Embed Chat Widget in Your App
-
-**Option A: iframe with URL params**
-
-```html
-<iframe
-  src="http://localhost:8081/chat?user_id=C10086&name=张三&phone=138xxxx"
-  style="width: 420px; height: 680px; border: none; border-radius: 16px;"
-></iframe>
-```
-
-**Option B: postMessage for SPAs (pass identity after login)**
-
-```javascript
-// In your app — after user logs in
-const iframe = document.getElementById('chatFrame');
-iframe.contentWindow.postMessage({
-  type: 'chat_user',
-  user_id: currentUser.id,
-  name: currentUser.name,
-  phone: currentUser.phone,
-  extra: { vip_level: 3 },
-}, '*');
-```
-
-**Option C: Set global before chat widget loads**
-
-```html
-<script>
-  window.CHAT_USER = { user_id: 'C10086', name: '张三', phone: '138xxxx' };
-</script>
-<script src="customer_service_chat.html"></script>
-```
-
-### 5.3 Dashboard REST API — Ticket Operations (Python)
+#### Python 调用 Dashboard API
 
 ```python
 import httpx
@@ -589,320 +660,121 @@ BASE = "http://localhost:8081"
 
 async def main():
     async with httpx.AsyncClient() as c:
-        # List open tickets
-        r = await c.get(f"{BASE}/api/tickets", params={"status": "open"})
-        tickets = r.json()
-        print(f"Open tickets: {len(tickets)}")
+        # 活跃会话
+        r = await c.get(f"{BASE}/api/sessions")
+        sessions = r.json()
+        print(f"Active: {sessions['count']}")
 
-        if not tickets:
-            return
-        tid = tickets[0]["id"]
+        # 会话详情 + 消息
+        if sessions['sessions']:
+            sid = sessions['sessions'][0]['session_id']
+            r = await c.get(f"{BASE}/api/sessions/{sid}")
+            detail = r.json()
+            for msg in detail['messages']:
+                print(f"  [{msg['sender']}] {msg['content']}")
 
-        # Get conversation history
-        r = await c.get(f"{BASE}/api/tickets/{tid}/messages")
-        for msg in r.json():
-            print(f"  [{msg['role']}] {msg['content']}")
+        # 日报
+        r = await c.get(f"{BASE}/api/report")
+        report = r.json()
+        print(f"Today: {report['total_sessions']} sessions, avg rating {report['avg_rating']}")
 
-        # Agent replies (sends to customer via their original IM channel)
-        await c.post(f"{BASE}/api/tickets/{tid}/reply", json={
-            "text": "Hi, I've checked your account. Your issue has been fixed."
-        })
-
-        # Resolve ticket (sends resolution message + triggers CSAT)
-        await c.post(f"{BASE}/api/tickets/{tid}/resolve")
+        # 客服负载
+        r = await c.get(f"{BASE}/api/agents/load")
+        for agent in r.json()['agents']:
+            print(f"  {agent['name']}: {agent['active_sessions']} sessions")
 
 import asyncio
 asyncio.run(main())
 ```
 
-### 5.4 Dashboard REST API — Ticket Operations (JavaScript)
+---
 
-```javascript
-const BASE = 'http://localhost:8081';
+## 7. 完整环境变量参考
 
-// List escalated tickets
-const tickets = await fetch(`${BASE}/api/tickets?status=escalated`).then(r => r.json());
+### 核心（必填）
 
-// Get messages
-const messages = await fetch(`${BASE}/api/tickets/${tickets[0].id}/messages`).then(r => r.json());
+| 变量 | 说明 |
+|------|------|
+| `CS_TELEGRAM_TOKEN` | Telegram Bot Token |
+| `CS_SUPPORT_GROUP_ID` | 超级群组 ID（以 `-100` 开头） |
 
-// Reply
-await fetch(`${BASE}/api/tickets/${tickets[0].id}/reply`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ text: 'We are looking into this.' }),
-});
+### 端口
 
-// Resolve
-await fetch(`${BASE}/api/tickets/${tickets[0].id}/resolve`, { method: 'POST' });
-```
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WEBCHAT_PORT` | 8081 | WebChat + Dashboard + QR |
+| `WKIM_PORT` | 8080 | WuKongIM 兼容端口 |
+| `CS_BASE_URL` | — | 公网基地址（反向代理时设置） |
 
-### 5.5 Real-time Dashboard (WebSocket)
+### LLM
 
-```javascript
-// Dashboard WebSocket — receives ticket lifecycle events
-const ws = new WebSocket('ws://localhost:8081/ws');
+| 变量 | 说明 |
+|------|------|
+| `MINIMAX_API_KEY` | MiniMax（推荐翻译） |
+| `DEEPSEEK_API_KEY` | DeepSeek（推荐 AI 回复） |
+| `OPENAI_API_KEY` | OpenAI（Whisper 语音 + 备选） |
+| `QWEN_API_KEY` | 通义千问 |
+| `GLM_API_KEY` | 智谱 GLM |
+| `CLAUDE_API_KEY` | Anthropic Claude |
+| `CS_ROUTER_TRANSLATE` | 翻译路由（默认 minimax） |
+| `CS_ROUTER_AI_REPLY` | AI 回复路由（默认 deepseek） |
+| `CS_ROUTER_DETECT_LANG` | 语言检测路由（默认 minimax） |
+| `CS_ROUTER_SUMMARIZE` | 摘要路由（默认 deepseek） |
 
-ws.onmessage = (e) => {
-  const event = JSON.parse(e.data);
+### 客服
 
-  switch (event.type) {
-    case 'message':
-      // New message on ticket — refresh chat view
-      refreshMessages(event.ticket_id);
-      break;
-    case 'resolved':
-      // Ticket resolved — update list
-      refreshTicketList();
-      break;
-  }
-};
-```
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `CS_AGENTS` | — | 客服名单（逗号分隔） |
+| `CS_MAX_SESSIONS_PER_AGENT` | 5 | 每客服最大并发 |
+| `CS_ALLOWED_AGENTS` | — | 白名单 Telegram User ID |
+| `CS_REPLY_TIMEOUT` | 180 | 超时提醒秒数 |
+| `CS_HEALTH_INTERVAL` | 30 | 健康检查间隔秒数 |
 
-### 5.6 QR Code Identity Binding
+### ERP
 
-Generate personalized deep links so users can scan a QR code with their IM app to connect.
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `CS_ERP_BACKEND` | mock | `mock` 或 `rest` |
+| `CS_ERP_BASE_URL` | — | REST API 地址 |
+| `CS_ERP_API_KEY` | — | API 认证 Key |
+| `CS_ERP_TIMEOUT` | 5 | 请求超时秒数 |
 
-**Step 1: Get connect links for a platform user**
+### 功能开关
 
-```python
-import httpx
-import qrcode  # pip install qrcode[pil]
+前缀 `CS_FEATURE_`，值 `true`/`false`：
 
-async def generate_qr_codes(user_id: str, tg_bot: str = "MyServiceBot"):
-    async with httpx.AsyncClient() as c:
-        r = await c.get(
-            f"http://localhost:8081/api/connect-links/{user_id}",
-            params={"tg_bot": tg_bot, "wa_number": "8613800001111"},
-        )
-        links = r.json()["links"]
-
-    # Generate QR code images
-    for channel, url in links.items():
-        if channel == "universal":
-            continue
-        qr = qrcode.make(url)
-        qr.save(f"qr_{channel}_{user_id}.png")
-        print(f"{channel}: {url}")
-
-    # Result:
-    # telegram: https://t.me/MyServiceBot?start=uid_U123
-    # whatsapp: https://wa.me/8613800001111?text=uid_U123
-```
-
-**Step 2: Show QR codes in frontend**
-
-```html
-<div id="connect-channels"></div>
-<script src="https://cdn.jsdelivr.net/npm/qrcodejs/qrcode.min.js"></script>
-<script>
-async function showConnectQR(userId) {
-  const r = await fetch(`/api/connect-links/${userId}?tg_bot=MyServiceBot`);
-  const { links } = await r.json();
-  const container = document.getElementById('connect-channels');
-
-  for (const [channel, url] of Object.entries(links)) {
-    if (channel === 'universal') continue;
-    const div = document.createElement('div');
-    div.innerHTML = `<h3>${channel}</h3>`;
-    container.appendChild(div);
-    new QRCode(div, { text: url, width: 200, height: 200 });
-  }
-}
-showConnectQR('USER123');
-</script>
-```
-
-**Step 3: Check user's bound channels**
-
-```python
-# After user scans QR and connects via IM, check what's bound:
-r = await c.get(f"{BASE}/api/user/USER123/bindings")
-# [{"channel": "telegram", "chat_id": "987654321", "bound_at": "..."},
-#  {"channel": "whatsapp", "chat_id": "8613800138000", "bound_at": "..."}]
-```
-
-### 5.7 Python — Build Your Own Support Server
-
-```python
-"""Minimal support server using unified-channel + unified-support."""
-import asyncio
-from unified_channel import ChannelManager, TelegramAdapter
-from unified_channel.adapters.webchat import WebChatAdapter
-
-from support.ai.backends import create_backend
-from support.ai.rag import KnowledgeBase
-from support.ai.router import AIRouter
-from support.dashboard.api import DashboardAPI
-from support.db import Database
-from support.tickets.manager import TicketMiddleware
-from support.tickets.escalation import EscalationMiddleware
-from support.tickets.identity import IdentityMiddleware
-from support.analytics.metrics import Analytics
-
-async def main():
-    # Database
-    db = Database("support.db")
-    await db.connect()
-
-    # AI (RAG over knowledge base)
-    llm = create_backend(backend_name="deepseek", api_key="sk-xxx", model="deepseek-chat")
-    kb = KnowledgeBase(db, "knowledge")
-    await kb.reindex()
-    ai = AIRouter(llm=llm, kb=kb)
-
-    # Channels
-    manager = ChannelManager()
-    manager.add_channel(WebChatAdapter(port=8080))       # Browser customers
-    manager.add_channel(TelegramAdapter(token="TOKEN"))   # Telegram customers
-
-    # Middleware pipeline (order matters)
-    manager.add_middleware(IdentityMiddleware(db))         # QR bind: IM → platform user
-    manager.add_middleware(TicketMiddleware(db))            # Auto-create tickets
-    manager.add_middleware(EscalationMiddleware(db, ai, send_fn=manager.send))
-
-    # Default handler — AI auto-reply
-    @manager.on_message
-    async def handle(msg):
-        history = (msg.metadata or {}).get("history", [])
-        formatted = [{"role": h["role"], "content": h["content"]} for h in history[-10:]]
-        return await ai.generate_reply(msg.content.text or "", formatted)
-
-    # Agent dashboard
-    dashboard = DashboardAPI(db=db, analytics=Analytics(db), send_fn=manager.send, port=8081)
-    await dashboard.start()
-
-    try:
-        await manager.run()
-    finally:
-        await dashboard.stop()
-        await db.close()
-
-asyncio.run(main())
-```
-
-### 5.8 POC — Quick Start (Telegram Group + WebChat)
-
-The POC (`examples/customer_service_poc.py`) is a standalone full-featured system. No unified-support needed.
-
-```bash
-cd unified-channel
-
-# Configure
-cat > examples/.env << 'EOF'
-TELEGRAM_TOKEN=your-bot-token
-SUPPORT_GROUP_ID=-100xxxxxxxxxx
-
-# AI auto-reply (optional)
-CS_AI_ENABLED=true
-DEEPSEEK_API_KEY=sk-xxx
-CS_ROUTER_AI_REPLY=deepseek
-
-# Translation (optional)
-MINIMAX_API_KEY=xxx
-CS_ROUTER_TRANSLATE=minimax
-CS_ROUTER_DETECT_LANG=minimax
-
-# Agents (optional, comma-separated Telegram user IDs)
-CS_AGENTS=user1,user2
-CS_ALLOWED_AGENTS=12345,67890
-
-# Timeouts
-CS_REPLY_TIMEOUT=180
-CS_HEALTH_INTERVAL=30
-EOF
-
-# Run
-.venv/bin/python examples/customer_service_poc.py
-
-# Open in browser
-# http://localhost:8081/chat
-```
-
-**POC architecture:**
-
-```
-Browser ──WebSocket──→ WebChatAdapter (:8081)
-                              ↓
-Mobile ──HTTP──→ WKIMCompatAdapter (:8080)     ChannelManager
-                              ↓                     ↓
-                         route by channel      on_message handler
-                              ↓                     ↓
-                     ┌── webchat/wkim ──→ forward_to_telegram()
-                     │                         ↓
-                     │              AI FAQ match? → reply directly
-                     │                         ↓ (no match)
-                     │              Create Telegram topic in support group
-                     │              Agent sees customer message + user info
-                     │
-                     └── telegram ──→ forward_to_user()
-                                         ↓
-                              Agent reply → translate if needed → send to customer
-                              /close → CSAT rating → close topic
-```
-
-**Agent commands (in Telegram support group):**
-
-| Command | Description |
-|---------|-------------|
-| `/erp [ID]` | Query ERP user info |
-| `/order [phone/ID]` | Query orders |
-| `/tpl [name]` | Send quick reply template |
-| `/ticket title` | Create a ticket |
-| `/close` | Close session + send CSAT rating |
-| `/history [N]` | View message history |
-| `/lang` | Check user language + translation status |
-| `/report [date]` | Daily report |
-| `/hotwords [days]` | Hot keyword analysis |
-| `/help` | Show all commands |
+| 开关 | 默认 | 说明 |
+|------|------|------|
+| `TRANSLATION` | true | 自动翻译 |
+| `AI_REPLY` | false | AI 自动回复 |
+| `QUEUE` | true | 排队机制 |
+| `AGENT_ASSIGNMENT` | true | 自动分配 |
+| `SENSITIVE_FILTER` | false | 敏感词检测 |
+| `RATINGS` | true | 满意度评价 |
+| `TICKETS` | true | 工单系统 |
+| `TIMEOUT_ALERTS` | true | 超时提醒 |
+| `ACCESS_CONTROL` | false | 权限管控 |
+| `REPORTS` | true | 报表分析 |
+| `TEMPLATES` | true | 快捷模板 |
+| `ONLINE_STATUS` | true | 在线状态 |
+| `HISTORY` | true | 消息历史 |
 
 ---
 
-## 6. Configuration
+## 附录：客服端 Telegram 命令
 
-See `config.example.yaml` for full reference.
-
-```yaml
-channels:
-  telegram:
-    token: "${TELEGRAM_BOT_TOKEN}"
-  # webchat, whatsapp, wechat, line, discord, slack...
-
-ai:
-  backend: deepseek    # claude | deepseek | qwen | glm | minimax | openai
-  api_key: "${AI_API_KEY}"
-  model: deepseek-chat
-  temperature: 0.3
-
-escalation:
-  max_ai_turns: 8      # Auto-escalate after N AI replies
-
-agents:
-  - id: agent-1
-    name: Support Team
-    channel: telegram
-    chat_id: "${AGENT_CHAT_ID}"
-    skills: [general]
-
-dashboard:
-  port: 8081
-
-database:
-  path: ./data/support.db
-```
-
-Environment variables are interpolated with `${VAR}` or `${VAR:-default}` syntax.
-
----
-
-## 6. Quick Start
-
-```bash
-cd unified-support
-cp config.example.yaml config.yaml
-# Edit config.yaml with your tokens
-
-pip install -e .
-python -m support.app
-# Dashboard: http://localhost:8081
-```
+| 命令 | 功能 | 示例 |
+|------|------|------|
+| `/erp [ID]` | 查询客户 ERP 信息 | `/erp C10086` |
+| `/order [手机/ID]` | 查询订单 | `/order 13800138000` |
+| `/tpl [模板名]` | 发送快捷回复（自动翻译） | `/tpl greeting` |
+| `/ticket 标题` | 创建跟进工单 | `/ticket 退货问题` |
+| `/transfer <客服>` | 转接到其他客服 | `/transfer bob` |
+| `/close` | 关闭会话 + 发送评分 | `/close` |
+| `/history [N]` | 查看最近 N 条消息 | `/history 30` |
+| `/report [日期]` | 日报统计 | `/report 2026-03-10` |
+| `/hotwords [天数]` | 热词分析 | `/hotwords 14` |
+| `/queue` | 查看排队队列 | `/queue` |
+| `/lang` | 查看用户语言 + 翻译状态 | `/lang` |
+| `/help` | 显示所有命令 | `/help` |
