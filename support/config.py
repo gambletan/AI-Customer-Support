@@ -78,6 +78,17 @@ class Config:
     # Features
     features: Features = field(default_factory=Features)
 
+    def validate(self) -> list[str]:
+        """Return list of error messages. Empty = valid."""
+        errors = []
+        if not self.telegram_token:
+            errors.append("CS_TELEGRAM_TOKEN is required")
+        if not self.support_group_id:
+            errors.append("CS_SUPPORT_GROUP_ID is required")
+        elif not self.support_group_id.startswith("-100"):
+            errors.append("CS_SUPPORT_GROUP_ID must start with -100")
+        return errors
+
     def summary(self) -> list[str]:
         """Human-readable config summary for logging."""
         lines = ["Features enabled:"]

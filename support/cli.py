@@ -17,7 +17,7 @@ def main() -> None:
     cmd = args[0] if args else "run"
 
     if cmd in ("run", "start"):
-        from .telegram_gateway import main_entry
+        from .gateway import main_entry
         main_entry()
 
     elif cmd == "setup":
