@@ -31,6 +31,7 @@ from .state import (
     FAQ,
     SENSITIVE_WORDS,
     cfg,
+    dm_sessions,
     logger,
     pending_replies,
     router,
@@ -602,7 +603,7 @@ async def forward_to_user(manager: ChannelManager, msg: UnifiedMessage) -> None:
         )
         return
 
-    out = OutboundMessage(chat_id=session_id, text=translated_text)
+    out = OutboundMessage(chat_id=_resolve_chat_id(session_id), text=translated_text)
 
     if msg.content.type == ContentType.MEDIA and msg.raw:
         tg = manager._channels["telegram"]
@@ -752,7 +753,25 @@ async def send_history(manager: ChannelManager, session_id: str) -> None:
 # Helpers
 # =============================================================================
 
+def _resolve_chat_id(session_id: str) -> str:
+    """Resolve session_id to actual chat_id for sending messages.
+
+    "tg_12345" -> "12345", "wa_1234567890" -> "1234567890", others unchanged.
+    """
+    for prefix in ("tg_", "wa_"):
+        if session_id.startswith(prefix):
+            return session_id[len(prefix):]
+    return session_id
+
+
 def _find_user_channel(manager: ChannelManager, session_id: str):
+    # DM sessions (Telegram private chat / WhatsApp)
+    if session_id in dm_sessions:
+        if session_id.startswith("tg_"):
+            return manager._channels.get("telegram")
+        if session_id.startswith("wa_"):
+            return manager._channels.get("whatsapp")
+
     for ch_name in ("webchat", "wkim"):
         ch = manager._channels.get(ch_name)
         if not ch:
@@ -761,6 +780,75 @@ def _find_user_channel(manager: ChannelManager, session_id: str):
         if sessions and session_id in sessions:
             return ch
     return None
+
+
+# =============================================================================
+# DM channels (Telegram private chat / WhatsApp -> support group)
+# =============================================================================
+
+WELCOME_MSG = "您好！欢迎联系客服，请描述您的问题，我们会尽快回复。"
+
+
+async def handle_dm(manager: ChannelManager, msg: UnifiedMessage, prefix: str, channel_name: str) -> None:
+    """Handle private/DM messages from Telegram or WhatsApp users."""
+    user_id = msg.sender.id
+    if not user_id:
+        return
+
+    session_id = f"{prefix}_{user_id}"
+
+    is_start = msg.content.type == ContentType.COMMAND and msg.content.command == "start"
+    is_new = session_id not in dm_sessions and session_id not in session_to_topic
+
+    if is_new or is_start:
+        dm_sessions.add(session_id)
+        session_channel[session_id] = channel_name
+
+        user_info = {
+            "user_type": "authenticated",
+            "user_id": user_id,
+            "name": msg.sender.display_name or msg.sender.username or user_id,
+        }
+        if is_start and msg.content.args:
+            user_info["ref"] = msg.content.args[0]
+
+        await get_or_create_topic(manager, session_id, user_info, channel_name)
+
+        # Send welcome
+        adapter = manager._channels.get(msg.channel)
+        if adapter:
+            await adapter.send(OutboundMessage(
+                chat_id=_resolve_chat_id(session_id),
+                text=WELCOME_MSG,
+            ))
+
+        if is_start:
+            return
+
+    # Ensure session is tracked
+    if session_id not in dm_sessions:
+        dm_sessions.add(session_id)
+        session_channel[session_id] = channel_name
+
+    # Wrap and forward to support group
+    wrapped = UnifiedMessage(
+        id=msg.id,
+        channel=channel_name,
+        sender=msg.sender,
+        content=msg.content,
+        timestamp=msg.timestamp,
+        chat_id=session_id,
+        thread_id=msg.thread_id,
+        reply_to_id=msg.reply_to_id,
+        metadata={"user_info": {
+            "user_type": "authenticated",
+            "user_id": user_id,
+            "name": msg.sender.display_name or msg.sender.username or user_id,
+        }},
+        raw=msg.raw,
+    )
+    from .state import msg_queue
+    await msg_queue.run(session_id, forward_to_telegram(manager, wrapped))
 
 
 # =============================================================================

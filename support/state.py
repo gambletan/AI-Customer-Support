@@ -36,6 +36,9 @@ pending_replies: dict[str, asyncio.Task] = {}  # session_id -> timeout task
 # --- Waiting queue (when all agents are busy) ---
 waiting_queue: list[str] = []  # list of session_ids awaiting assignment
 
+# --- DM sessions (Telegram private chat / WhatsApp) ---
+dm_sessions: set[str] = set()  # session_ids of DM users (tg_xxx, wa_xxx)
+
 # --- Keyed queue for per-customer message serialization ---
 msg_queue = KeyedAsyncQueue()
 

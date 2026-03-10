@@ -35,6 +35,7 @@ from .translation import detect_language, translate_text  # noqa: F401
 from .forwarding import (  # noqa: F401
     _dequeue_next,
     _find_user_channel,
+    _resolve_chat_id,
     _telegram_file_url,
     _timeout_alert,
     auto_assign_agent,
@@ -44,6 +45,7 @@ from .forwarding import (  # noqa: F401
     forward_to_user,
     get_or_create_topic,
     handle_callback,
+    handle_dm,
     notify_user_offline,
     notify_user_online,
     send_history,
