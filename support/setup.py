@@ -87,7 +87,7 @@ def run_setup() -> None:
     env: dict[str, str] = {}
 
     # ── Step 1: Core (required) ──────────────────────────────────────
-    _header("Step 1/5: Telegram Bot (Required)")
+    _header("Step 1/6: Telegram Bot (Required)")
     print("Create a bot: message @BotFather on Telegram, send /newbot")
     print("Create a supergroup with Topics/Forum mode enabled")
     print("Add the bot as admin, get group ID via @RawDataBot")
@@ -106,7 +106,7 @@ def run_setup() -> None:
     env["CS_SUPPORT_GROUP_ID"] = group_id
 
     # ── Step 2: Ports ────────────────────────────────────────────────
-    _header("Step 2/5: Ports")
+    _header("Step 2/6: Ports")
 
     webchat_port = _ask(_cyan("WebChat port"), "8081")
     env["WEBCHAT_PORT"] = webchat_port
@@ -117,7 +117,7 @@ def run_setup() -> None:
     env["CS_DB_PATH"] = _ask(_cyan("Database path"), "cs_data.db")
 
     # ── Step 3: LLM Backends ────────────────────────────────────────
-    _header("Step 3/5: LLM Backends")
+    _header("Step 3/6: LLM Backends")
     print("Configure at least one LLM for translation and AI features.")
     print("You can add more later by editing .env")
     print()
@@ -166,8 +166,39 @@ def run_setup() -> None:
             if val != default_backend:
                 env[f"CS_ROUTER_{task}"] = val
 
-    # ── Step 4: Agents ───────────────────────────────────────────────
-    _header("Step 4/5: Agent Setup")
+    # ── Step 4: IM Channels ─────────────────────────────────────────
+    _header("Step 4/6: IM Channels")
+    print("Enable additional IM channels for customers to reach you.")
+    print("Each channel requires its own API credentials.")
+    print("Users scan one QR code and pick their preferred channel.")
+    print()
+
+    from .channels import CHANNELS
+
+    for ch in CHANNELS:
+        if _ask_yn(f"Enable {_green(ch.name)}? {_dim(ch.notes)}", default=False):
+            print(f"  Required: {', '.join(ch.required_keys)}")
+            for key in ch.required_keys:
+                val = _ask(f"  {ch.env_prefix}{key}")
+                if val:
+                    env[f"{ch.env_prefix}{key}"] = val
+            if ch.optional_keys:
+                if _ask_yn(f"  Configure optional settings? {_dim(', '.join(ch.optional_keys))}", default=False):
+                    for key in ch.optional_keys:
+                        default_val = str(ch.default_port) if key == "PORT" and ch.default_port else ""
+                        val = _ask(f"  {ch.env_prefix}{key}", default_val)
+                        if val:
+                            env[f"{ch.env_prefix}{key}"] = val
+            print()
+
+    # Base URL for QR code (needed if behind reverse proxy)
+    if _ask_yn("Set public base URL? (for QR code / reverse proxy)", default=False):
+        base_url = _ask(_cyan("Base URL (e.g. https://cs.example.com)"))
+        if base_url:
+            env["CS_BASE_URL"] = base_url
+
+    # ── Step 5: Agents ───────────────────────────────────────────────
+    _header("Step 5/6: Agent Setup")
 
     if _ask_yn("Configure named agents? (for load balancing and transfer)", default=False):
         agents = _ask(_cyan("Agent names (comma-separated)"), "")
@@ -186,8 +217,8 @@ def run_setup() -> None:
     if timeout != "180":
         env["CS_REPLY_TIMEOUT"] = timeout
 
-    # ── Step 5: Features ─────────────────────────────────────────────
-    _header("Step 5/5: Features")
+    # ── Step 6: Features ─────────────────────────────────────────────
+    _header("Step 6/6: Features")
     print("Enable/disable optional features. Core message routing is always on.")
     print()
 
@@ -230,6 +261,16 @@ def run_setup() -> None:
                 k = f"{prefix}{suffix}"
                 if k in env:
                     lines.append(f"{k}={env[k]}")
+
+    # IM Channels
+    channel_keys = [k for k in env if any(k.startswith(ch.env_prefix) for ch in CHANNELS)]
+    if channel_keys:
+        lines.append("")
+        lines.append("# === IM Channels ===")
+        for k in sorted(channel_keys):
+            lines.append(f"{k}={env[k]}")
+    if "CS_BASE_URL" in env:
+        lines.append(f"CS_BASE_URL={env['CS_BASE_URL']}")
 
     # Task routing
     routing_keys = [k for k in env if k.startswith("CS_ROUTER_")]

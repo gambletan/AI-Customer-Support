@@ -67,18 +67,6 @@ class Config:
         os.environ.get("CS_MAX_SESSIONS_PER_AGENT", "5")
     )
 
-    # WhatsApp (optional)
-    wa_access_token: str = os.environ.get("CS_WA_ACCESS_TOKEN", "")
-    wa_phone_number_id: str = os.environ.get("CS_WA_PHONE_NUMBER_ID", "")
-    wa_verify_token: str = os.environ.get("CS_WA_VERIFY_TOKEN", "")
-    wa_app_secret: str = os.environ.get("CS_WA_APP_SECRET", "")
-    wa_port: int = int(os.environ.get("CS_WA_PORT", "8443"))
-    wa_phone_number: str = os.environ.get("CS_WA_PHONE_NUMBER", "")  # for wa.me link
-
-    @property
-    def wa_enabled(self) -> bool:
-        return bool(self.wa_access_token and self.wa_phone_number_id and self.wa_verify_token)
-
     # Timeouts
     reply_timeout: int = int(os.environ.get("CS_REPLY_TIMEOUT", "180"))
     health_interval: int = int(os.environ.get("CS_HEALTH_INTERVAL", "30"))

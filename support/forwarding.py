@@ -756,21 +756,26 @@ async def send_history(manager: ChannelManager, session_id: str) -> None:
 def _resolve_chat_id(session_id: str) -> str:
     """Resolve session_id to actual chat_id for sending messages.
 
-    "tg_12345" -> "12345", "wa_1234567890" -> "1234567890", others unchanged.
+    "tg_12345" -> "12345", "wa_1234567890" -> "1234567890", etc.
+    All DM session IDs use the pattern: {prefix}_{user_id}
     """
-    for prefix in ("tg_", "wa_"):
-        if session_id.startswith(prefix):
-            return session_id[len(prefix):]
+    from .channels import CHANNEL_BY_PREFIX
+    for prefix in CHANNEL_BY_PREFIX:
+        tag = f"{prefix}_"
+        if session_id.startswith(tag):
+            return session_id[len(tag):]
     return session_id
 
 
 def _find_user_channel(manager: ChannelManager, session_id: str):
-    # DM sessions (Telegram private chat / WhatsApp)
+    # DM sessions — match any channel prefix
     if session_id in dm_sessions:
-        if session_id.startswith("tg_"):
-            return manager._channels.get("telegram")
-        if session_id.startswith("wa_"):
-            return manager._channels.get("whatsapp")
+        from .channels import CHANNEL_BY_PREFIX
+        for prefix, ch_def in CHANNEL_BY_PREFIX.items():
+            if session_id.startswith(f"{prefix}_"):
+                # Telegram DM uses the "telegram" adapter, not "telegram_dm"
+                ch_id = "telegram" if ch_def.channel_id == "telegram" else ch_def.channel_id
+                return manager._channels.get(ch_id)
 
     for ch_name in ("webchat", "wkim"):
         ch = manager._channels.get(ch_name)
